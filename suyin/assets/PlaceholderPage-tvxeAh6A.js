@@ -1,0 +1,1 @@
+import{d as t,c as o,w as a,o as r,a as s,u as n,b as c}from"./index-Cur40y_Z.js";import{S as l}from"./SEmpty-FTWMZNdt.js";import{S as u}from"./SSection-CJFP3_5X.js";const S=t({__name:"PlaceholderPage",setup(i){const e=c();return(m,p)=>(r(),o(u,null,{default:a(()=>[s(l,{icon:"refresh",title:`${n(e).meta.title}正在重写`},null,8,["title"])]),_:1}))}});export{S as default};

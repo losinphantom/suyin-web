@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>苏银 · 网页入口</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --canvas: #f8f6f2;
+      --surface: #fffdfa;
+      --ink: #262420;
+      --muted: #5b554d;
+      --line: #ded7ce;
+      --accent: #79513b;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --canvas: #1e1c1a;
+        --surface: #262320;
+        --ink: #f4eee8;
+        --muted: #cbc0b5;
+        --line: #494038;
+        --accent: #edb996;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--canvas);
+      color: var(--ink);
+      font: 1rem/1.55 system-ui, sans-serif;
+    }
+    main {
+      width: min(100% - 2.5rem, 44rem);
+      margin: clamp(3rem, 13vh, 9rem) auto 3rem;
+    }
+    h1 { margin: 0 0 1.5rem; font-size: clamp(2rem, 6vw, 3rem); }
+    nav { display: grid; gap: .8rem; }
+    a {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 1rem;
+      padding: 1.2rem 1.3rem;
+      border: 1px solid var(--line);
+      border-radius: .85rem;
+      background: var(--surface);
+      color: inherit;
+      text-decoration: none;
+    }
+    a:hover, a:focus-visible { border-color: var(--accent); }
+    a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    strong, small { display: block; }
+    strong { font-size: 1.15rem; }
+    small { margin-top: .22rem; color: var(--muted); font-size: .9rem; }
+    .arrow { color: var(--accent); font-size: 1.3rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>苏银 · 网页入口</h1>
+    <nav aria-label="网页入口">
+      <a href="./suyin/">
+        <span>
+          <strong>新版苏银网页版</strong>
+          <small>角色聊天、创作与苏银的房间</small>
+        </span>
+        <span class="arrow" aria-hidden="true">→</span>
+      </a>
+      <a href="./walk-sheet-v2/">
+        <span>
+          <strong>行走图生成器 V2</strong>
+          <small>生成与编辑 RPG Maker MZ 四向行走图</small>
+        </span>
+        <span class="arrow" aria-hidden="true">→</span>
+      </a>
+    </nav>
+  </main>
+</body>
+</html>

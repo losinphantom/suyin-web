@@ -469,6 +469,7 @@ img{display:block;max-width:100%}
 
       <div class="field-row" style="margin-top:10px">
         <label class="check"><input type="checkbox" id="ppPixelSnap" checked> 真实像素格还原</label>
+        <label class="check"><input type="checkbox" id="ppLockUpper" checked> 锁定头和上身</label>
   
       </div>
 
@@ -732,6 +733,9 @@ img{display:block;max-width:100%}
     rawSheetCuts: null,
     rawSheetCells: null,
     sources: new Array(12).fill(''),
+    bodyCellHeights: {},
+    unlockedFrames: new Array(12).fill(''),
+    lockResults: new Array(12).fill(null),
     edited: new Array(12).fill(false),
     pool: [],
     poolSources: [],
@@ -759,6 +763,7 @@ img{display:block;max-width:100%}
       bgTol: 36,
       paletteCount: 32,
       pixelSnap: true,
+      lockUpper: true,
       alphaThresh: 128,
       outline: false,
       outlineColor: '#1e1a18',
@@ -825,8 +830,10 @@ img{display:block;max-width:100%}
     try {
       localStorage.setItem(STORAGE_STATE, JSON.stringify({
         frames: state.frames,
+        unlockedFrames: state.unlockedFrames,
         rawFrames: state.rawFrames,
         sources: state.sources,
+        bodyCellHeights: state.bodyCellHeights,
         edited: state.edited,
         overflow: state.overflow,
         scaleApprovals: state.scaleApprovals,
@@ -852,8 +859,10 @@ img{display:block;max-width:100%}
       if (!raw) return;
       var d = JSON.parse(raw);
       if (Array.isArray(d.frames) && d.frames.length === 12) state.frames = d.frames;
+      state.unlockedFrames = d.unlockedFrames || state.frames.slice();
       if (Array.isArray(d.rawFrames) && d.rawFrames.length === 12) state.rawFrames = d.rawFrames;
       if (Array.isArray(d.sources) && d.sources.length === 12) state.sources = d.sources;
+      state.bodyCellHeights = d.bodyCellHeights || {};
       state.overflow = d.overflow || [];
       state.scaleApprovals = d.scaleApprovals || new Array(12).fill(false);
       state.palette = d.palette || null;
@@ -1637,7 +1646,7 @@ img{display:block;max-width:100%}
       }
 
       var pad = Math.max(4, Math.round(Math.min(W, H) * 0.01));
-      return ordered.map(function(b){
+      var autoFrames = ordered.map(function(b){
         var sx = Math.max(0, b.minX - pad);
         var sy = Math.max(0, b.minY - pad);
         var ex = Math.min(W - 1, b.maxX + pad);
@@ -1648,6 +1657,11 @@ img{display:block;max-width:100%}
         cv.getContext('2d').drawImage(orig, sx, sy, cw, ch, 0, 0, cw, ch);
         return cv.toDataURL('image/png');
       });
+      if (rows.length) {
+        var columns = Math.max.apply(null, rows.map(function(row){ return row.items.length; }));
+        autoFrames.cellHeight = rows.length > 1 ? H / rows.length : Math.min(H, W / columns);
+      }
+      return autoFrames;
     });
   }
 
@@ -2033,13 +2047,14 @@ img{display:block;max-width:100%}
     grid = grid || measureFrameGrid(srcCanvas, bbox);
     var w = grid.w, h = grid.h, gx = grid.x.fit, gy = grid.y.fit;
     var sharedX = fallbackStep && fallbackStep.sx, sharedY = fallbackStep && fallbackStep.sy;
-    var sx = gx.scale > 1 ? gx.scale : sharedX || (gy.scale > 1 ? gy.scale : 0);
-    var sy = gy.scale > 1 ? gy.scale : sharedY || (gx.scale > 1 ? gx.scale : 0);
+    var bodyStep = fallbackStep && fallbackStep.bodyStep;
+    var sx = bodyStep || (gx.scale > 1 ? gx.scale : sharedX || (gy.scale > 1 ? gy.scale : 0));
+    var sy = bodyStep || (gy.scale > 1 ? gy.scale : sharedY || (gx.scale > 1 ? gx.scale : 0));
     if (!sx || !sy) return null;
-    var elastic = Math.min(gx.coherence, gy.coherence) < 0.7;
+    var elastic = !bodyStep && Math.min(gx.coherence, gy.coherence) < 0.7;
     var xs = axisSpans(grid.x, w, sx, elastic), ys = axisSpans(grid.y, h, sy, elastic);
     if (!xs.length || !ys.length) return null;
-    var sampled = sampleGridCells(grid, xs, ys);
+    var sampled = sampleGridCells(grid, xs, ys, !!bodyStep);
     var error = reconstructError(grid, xs, ys, sampled.img.data);
     var squarePrior = Math.abs(sx - sy) / Math.max(sx, sy) < 0.08 ? (sx + sy) / 2 : 0;
 
@@ -2074,8 +2089,10 @@ img{display:block;max-width:100%}
       sampled = winner.pixels;
       error = winner.residual;
     }
-    reviewAxis(grid.x, w, sx, sharedX, true);
-    reviewAxis(grid.y, h, sy, sharedY, false);
+    if (!bodyStep) {
+      reviewAxis(grid.x, w, sx, sharedX, true);
+      reviewAxis(grid.y, h, sy, sharedY, false);
+    }
 
     var rawOut = sampled.canvas, od = sampled.img.data;
     var outW = rawOut.width, outH = rawOut.height;
@@ -2100,37 +2117,87 @@ img{display:block;max-width:100%}
     var trimmed = document.createElement('canvas'); trimmed.width = nBox.bw; trimmed.height = nBox.bh;
     trimmed.getContext('2d').drawImage(rawOut, nBox.minX, nBox.minY, nBox.bw, nBox.bh, 0, 0, nBox.bw, nBox.bh);
     return { canvas: trimmed, bbox: { minX: 0, minY: 0, maxX: nBox.bw - 1, maxY: nBox.bh - 1, bw: nBox.bw, bh: nBox.bh },
-      snapped: true, stepX: sx, stepY: sy, error: error, removed: removed,
+      snapped: true, bodyGrid: !!bodyStep, stepX: sx, stepY: sy, error: error, removed: removed,
       phaseX: axisPhase(grid.x.energy, sx, gx.total).o, phaseY: axisPhase(grid.y.energy, sy, gy.total).o,
       coherence: (axisPhase(grid.x.energy, sx, gx.total).c + axisPhase(grid.y.energy, sy, gy.total).c) / 2 };
   }
 
-  function sampleGridCells(grid, xs, ys){
+  function sampleBodyCore(data, w, h, positions, xs, ys, labAt){
+    var points = positions.map(function(p){ return labAt(p); });
+    var median = [0, 1, 2].map(function(channel){
+      var values = points.map(function(lab){ return lab[channel]; }).sort(function(a, b){ return a - b; });
+      var mid = values.length >> 1;
+      return (values[mid] + values[(values.length - 1) >> 1]) / 2;
+    });
+    // Select an actual source pixel near the median, so broad midtones keep
+    // their votes even when their RGB values fall in neighboring 8-bit bins.
+    var cx = (xs[0] + xs[1]) / 2, cy = (ys[0] + ys[1]) / 2;
+    var sx = xs[1] - xs[0], sy = ys[1] - ys[0];
+    var best = 0, nearest = Infinity, detail = -1, prominence = 0;
+    for (var i = 0; i < positions.length; i++) {
+      var p = positions[i];
+      var x = p % w, y = Math.floor(p / w);
+      var offset = Math.hypot((x + 0.5 - cx) / sx, (y + 0.5 - cy) / sy);
+      var distance = oklabDistSq(points[i], median);
+      var score = distance + offset * 0.00025;
+      if (score < nearest) { nearest = score; best = i; }
+      if (offset > 0.28 || distance < 0.085 * 0.085) continue;
+      var color = points[i];
+      var support = points.filter(function(other){ return oklabDistSq(color, other) < 0.045 * 0.045; }).length;
+      if (support < Math.max(2, Math.ceil(points.length * 0.27))) continue;
+
+      // A coherent minority can represent a pupil, iris or glint. Reject long
+      // edges and silhouette bleed by checking for contrast on both axes.
+      var probes = [[Math.round(cx - sx), y], [Math.round(cx + sx), y],
+        [x, Math.round(cy - sy)], [x, Math.round(cy + sy)]];
+      var contrast = probes.map(function(probe){
+        var px = probe[0], py = probe[1], index = py * w + px;
+        return px >= 0 && px < w && py >= 0 && py < h && data[index * 4 + 3] >= 128 &&
+          oklabDistSq(color, labAt(index)) >= 0.085 * 0.085;
+      });
+      var count = contrast.filter(Boolean).length;
+      if (count < 3 && !(contrast[0] && contrast[1] && color[2] < median[2] - 0.02)) continue;
+      var strength = support * Math.min(Math.sqrt(distance), 0.22) - offset;
+      if (strength > prominence) { prominence = strength; detail = i; }
+    }
+    return positions[detail < 0 ? best : detail] * 4;
+  }
+
+  function sampleGridCells(grid, xs, ys, fixedCore){
     var w = grid.w, h = grid.h, d = grid.data;
     var outW = xs.length, outH = ys.length;
     var rawOut = document.createElement('canvas'); rawOut.width = outW; rawOut.height = outH;
     var oCtx = rawOut.getContext('2d', { willReadFrequently: true });
     var oImg = oCtx.createImageData(outW, outH);
     var od = oImg.data, support = new Float32Array(outW * outH);
+    var labs = new Map();
+    function labAt(p){
+      var o = p * 4, k = (d[o] << 16) | (d[o + 1] << 8) | d[o + 2];
+      if (!labs.has(k)) labs.set(k, rgbToOklab(d[o], d[o + 1], d[o + 2]));
+      return labs.get(k);
+    }
 
     // 每格内部 60% 核心区域投票取主导簇 RGB 中位数
     for (var r = 0; r < outH; r++) {
       var y0 = ys[r][0], y1 = ys[r][1];
       var my = (y1 - y0) * 0.2;
-      var ry0 = Math.max(0, Math.floor(y0 + my)), ry1 = Math.min(h, Math.max(ry0 + 1, Math.ceil(y1 - my)));
+      var ry0 = Math.max(0, fixedCore ? Math.ceil(y0 + my - 0.5) : Math.floor(y0 + my));
+      var ry1 = Math.min(h, Math.max(ry0 + 1, Math.ceil(y1 - my - (fixedCore ? 0.5 : 0))));
       for (var c = 0; c < outW; c++) {
         var x0 = xs[c][0], x1 = xs[c][1];
         var mx = (x1 - x0) * 0.2;
-        var rx0 = Math.max(0, Math.floor(x0 + mx)), rx1 = Math.min(w, Math.max(rx0 + 1, Math.ceil(x1 - mx)));
+        var rx0 = Math.max(0, fixedCore ? Math.ceil(x0 + mx - 0.5) : Math.floor(x0 + mx));
+        var rx1 = Math.min(w, Math.max(rx0 + 1, Math.ceil(x1 - mx - (fixedCore ? 0.5 : 0))));
 
-        var bins = new Map(), pxList = [], clearCnt = 0, opqCnt = 0;
+        var bins = new Map(), pxList = [], positions = [], clearCnt = 0, opqCnt = 0;
         function collectRect(ax0, ay0, ax1, ay1){
-          bins.clear(); pxList.length = 0; clearCnt = 0; opqCnt = 0;
+          bins.clear(); pxList.length = 0; positions.length = 0; clearCnt = 0; opqCnt = 0;
           for (var py = ay0; py < ay1; py++) {
             for (var px = ax0; px < ax1; px++) {
               var po = (py * w + px) * 4;
               if (d[po + 3] < 128) { clearCnt++; continue; }
               opqCnt++;
+              if (fixedCore) { positions.push(py * w + px); continue; }
               var pr = d[po], pg = d[po + 1], pb = d[po + 2];
               var key = ((pr >> 3) << 10) | ((pg >> 3) << 5) | (pb >> 3);
               bins.set(key, (bins.get(key) || 0) + 1);
@@ -2142,8 +2209,15 @@ img{display:block;max-width:100%}
         if (clearCnt + opqCnt === 0) {
           collectRect(Math.max(0, Math.floor(x0)), Math.max(0, Math.floor(y0)), Math.min(w, Math.ceil(x1)), Math.min(h, Math.ceil(y1)));
         }
-        if (opqCnt === 0 || clearCnt > opqCnt) continue;
+        if (opqCnt === 0 || clearCnt > opqCnt || (fixedCore && clearCnt === opqCnt)) continue;
 
+        if (fixedCore) {
+          var picked = sampleBodyCore(d, w, h, positions, xs[c], ys[r], labAt);
+          var cell = r * outW + c, offset = cell * 4;
+          support[cell] = opqCnt / (clearCnt + opqCnt);
+          od[offset] = d[picked]; od[offset + 1] = d[picked + 1]; od[offset + 2] = d[picked + 2]; od[offset + 3] = 255;
+          continue;
+        }
         var winKey = -1, winCnt = -1;
         bins.forEach(function(cnt, k){ if (cnt > winCnt) { winCnt = cnt; winKey = k; } });
         var rs = [], gs = [], bs = [];
@@ -2324,17 +2398,7 @@ img{display:block;max-width:100%}
       oklabDistSq(a, b) < paletteMinDistance * paletteMinDistance;
   }
 
-  function paletteRamp(lab){
-    if (lab[0] < nearBlackLightness) return 'black';
-    var chroma = Math.hypot(lab[1], lab[2]);
-    if (chroma < 0.018) return 'neutral';
-    var hue = Math.atan2(lab[2], lab[1]) * 180 / Math.PI;
-    var sector = Math.floor(((hue + 380) % 360) / 40);
-    return sector + ':' + (chroma >= 0.07 ? 'vivid' : 'muted');
-  }
-
-  function buildUnifiedPaletteOklab(canvases, colorBudget, reserved){
-    var maxColors = colorBudget - reserved.length;
+  function buildUnifiedPaletteOklab(canvases, maxColors){
     var rawMap = new Map();
     for (var i = 0; i < canvases.length; i++) {
       var c = canvases[i]; if (!c) continue;
@@ -2351,7 +2415,7 @@ img{display:block;max-width:100%}
       var r = (key >> 16) & 255, g = (key >> 8) & 255, b = key & 255;
       rawArr.push({ r: r, g: g, b: b, w: w, lab: rgbToOklab(r, g, b) });
     });
-    if (!rawArr.length || !maxColors) return reserved;
+    if (!rawArr.length) return [];
     rawArr.sort(function(a, b){ return b.w - a.w; });
 
     // 第一阶段：只合并感知上非常接近的噪声色，并实时更新加权质心
@@ -2359,12 +2423,9 @@ img{display:block;max-width:100%}
     var clusters = [];
     for (var ri = 0; ri < rawArr.length; ri++) {
       var it = rawArr[ri], bestCl = null, bestD = mergeThreshSq;
-      var nearBlack = it.lab[0] < nearBlackLightness;
       for (var cj = 0; cj < clusters.length; cj++) {
-        var cluster = clusters[cj];
-        if (nearBlack !== (cluster.lab[0] < nearBlackLightness)) continue;
-        var d2 = oklabWeightedDistSq(it.lab, cluster.lab);
-        if (d2 < bestD || nearBlack) { bestD = d2; bestCl = cluster; }
+        var d2 = oklabWeightedDistSq(it.lab, clusters[cj].lab);
+        if (d2 < bestD) { bestD = d2; bestCl = clusters[cj]; }
       }
       if (bestCl) {
         bestCl.sr += it.r * it.w; bestCl.sg += it.g * it.w; bestCl.sb += it.b * it.w;
@@ -2381,22 +2442,79 @@ img{display:block;max-width:100%}
       }
     }
 
-    // Group similar hues and chroma before allocating lightness levels.
-    // A small, saturated feature gets a slot independently from a muted material.
+    if (clusters.length <= maxColors) {
+      return clusters.map(function(o){ return { rgb: [o.r, o.g, o.b], lab: o.lab, w: o.w }; });
+    }
+
+    // 第二阶段：按色相扇区（+ 明暗分段）分组保底，确保肤色/蓝眼/棕靴等小面积色相各有独立槽位
     var hueGroups = new Map();
-    clusters.forEach(function(cl){
-      var key = paletteRamp(cl.lab);
-      if (!hueGroups.has(key)) hueGroups.set(key, []);
-      hueGroups.get(key).push(cl);
-    });
+    for (var ci = 0; ci < clusters.length; ci++) {
+      var cl = clusters[ci];
+      var chroma = Math.hypot(cl.lab[1], cl.lab[2]);
+      var gKey = 'N';
+      if (chroma >= 0.022) {
+        var deg = Math.atan2(cl.lab[2], cl.lab[1]) * 180 / Math.PI;
+        if (deg < 0) deg += 360;
+        gKey = 'H' + Math.floor(deg / 20);
+      }
+      if (!hueGroups.has(gKey)) hueGroups.set(gKey, []);
+      hueGroups.get(gKey).push(cl);
+    }
+
     var boxes = [];
     var minorPool = [];
-    hueGroups.forEach(function(list){
-      var weight = list.reduce(function(sum, entry){ return sum + entry.w; }, 0);
-      if (weight < 4) minorPool.push.apply(minorPool, list);
-      else boxes.push(list);
+    hueGroups.forEach(function(list, gKey){
+      var totalW = 0;
+      for (var i = 0; i < list.length; i++) totalW += list[i].w;
+      if (gKey !== 'N' && totalW < 4) {
+        for (var m = 0; m < list.length; m++) minorPool.push(list[m]);
+        return;
+      }
+      if (gKey !== 'N' && list.length >= 2) {
+        var minL = 1, maxL = 0, minC = 1, maxC = 0;
+        for (var j = 0; j < list.length; j++) {
+          var lj = list[j].lab[0], cj = Math.hypot(list[j].lab[1], list[j].lab[2]);
+          if (lj < minL) minL = lj; if (lj > maxL) maxL = lj;
+          if (cj < minC) minC = cj; if (cj > maxC) maxC = cj;
+        }
+        var subs = [list];
+        // 同一色相下跨越明暗（例如亮肉色肤色 vs 暗棕色靴子）各保底一个子组
+        if (maxL - minL > 0.22) {
+          var midL = (minL + maxL) / 2, hi = [], lo = [], hiW = 0, loW = 0;
+          for (var j2 = 0; j2 < list.length; j2++) {
+            if (list[j2].lab[0] >= midL) { hi.push(list[j2]); hiW += list[j2].w; }
+            else { lo.push(list[j2]); loW += list[j2].w; }
+          }
+          if (hi.length && lo.length && hiW >= 4 && loW >= 4) subs = [hi, lo];
+        }
+        // 同一色相下跨越高低饱和（例如高饱和蓝眼 vs 蓝灰披风）各保底一个子组
+        if (maxC - minC > 0.038) {
+          var nextSubs = [];
+          for (var si = 0; si < subs.length; si++) {
+            var sl = subs[si], sMinC = 1, sMaxC = 0;
+            for (var sk = 0; sk < sl.length; sk++) {
+              var scj = Math.hypot(sl[sk].lab[1], sl[sk].lab[2]);
+              if (scj < sMinC) sMinC = scj; if (scj > sMaxC) sMaxC = scj;
+            }
+            if (sl.length >= 2 && sMaxC - sMinC > 0.038) {
+              var midC = (sMinC + sMaxC) / 2, viv = [], mut = [], vivW = 0, mutW = 0;
+              for (var sk2 = 0; sk2 < sl.length; sk2++) {
+                if (Math.hypot(sl[sk2].lab[1], sl[sk2].lab[2]) >= midC) { viv.push(sl[sk2]); vivW += sl[sk2].w; }
+                else { mut.push(sl[sk2]); mutW += sl[sk2].w; }
+              }
+              if (viv.length && mut.length && vivW >= 4 && mutW >= 4) { nextSubs.push(viv, mut); continue; }
+            }
+            nextSubs.push(sl);
+          }
+          subs = nextSubs;
+        }
+        for (var bi0 = 0; bi0 < subs.length; bi0++) boxes.push(subs[bi0]);
+        return;
+      }
+      boxes.push(list);
     });
-    if (!boxes.length) { boxes.push(clusters); minorPool = []; }
+
+    if (!boxes.length) boxes.push(clusters);
     // 若极小噪点色独立未入组，归并到最近的有效组
     function boxCentroid(box){
       var sr = 0, sg = 0, sb = 0, sw = 0;
@@ -2433,54 +2551,81 @@ img{display:block;max-width:100%}
       boxes = kept.map(function(k){ return k.box; });
     }
 
-    // Start every populated ramp with its centroid. Only spend an additional
-    // slot when the two new shades are distinct and the ramp has room.
-    function distinctPalette(candidates){
-      var palette = reserved.slice();
-      var ramps = new Map();
-      candidates.slice().sort(function(a, b){ return b.w - a.w; }).forEach(function(entry){
-        var ramp = paletteRamp(entry.lab), count = ramps.get(ramp) || 0;
-        if (count >= 4 || palette.some(function(other){ return samePaletteShade(entry.lab, other.lab); })) return;
-        palette.push(entry);
-        ramps.set(ramp, count + 1);
-      });
-      return palette;
-    }
-    boxes.forEach(function(box){ box.sort(function(a, b){ return a.lab[0] - b.lab[0]; }); });
-    var cents = boxes.map(boxCentroid);
-    var palette = distinctPalette(cents);
-    while (palette.length < colorBudget) {
-      var bestIdx = -1, bestGain = 0, bestSplit, bestCents, bestPalette;
+    // 第三阶段：在剩余槽位内按加权色差 SSE 细分最大误差箱，避免浪费名额给离群孤点
+    var chromaAxisW = Math.sqrt(4.5);
+    var stopRadiusSq = 0.03 * 0.03;
+    while (boxes.length < maxColors) {
+      var bestIdx = -1, bestSse = 0, bestAxis = 0;
       for (var bi = 0; bi < boxes.length; bi++) {
-        var box = boxes[bi], cent = cents[bi];
-        // Ramp levels are ordered by lightness. Evaluate the weighted median
-        // split, which avoids spending a level on a handful of texture pixels.
-        if (box.length < 2) continue;
-        var acc = 0, split = 1;
-        for (var j = 0; j < box.length - 1; j++) {
-          acc += box[j].w;
-          split = j + 1;
-          if (acc >= cent.w / 2) break;
+        var box = boxes[bi];
+        if (box.length <= 1) continue;
+        var cent = boxCentroid(box);
+        var sse = 0, maxR2 = 0;
+        var v0 = 0, v1 = 0, v2 = 0;
+        for (var k = 0; k < box.length; k++) {
+          var lb = box[k].lab, w = box[k].w;
+          var dl = lb[0] - cent.lab[0];
+          var da = (lb[1] - cent.lab[1]) * chromaAxisW;
+          var db = (lb[2] - cent.lab[2]) * chromaAxisW;
+          var d2 = dl * dl + da * da + db * db;
+          if (d2 > maxR2) maxR2 = d2;
+          sse += w * d2;
+          v0 += w * dl * dl; v1 += w * da * da; v2 += w * db * db;
         }
-        var halves = [box.slice(0, split), box.slice(split)];
-        var next = halves.map(boxCentroid);
-        if (samePaletteShade(next[0].lab, next[1].lab)) continue;
-        var gain = next.reduce(function(sum, c){
-          return sum + c.w * oklabWeightedDistSq(c.lab, cent.lab);
-        }, 0);
-        if (gain <= bestGain) continue;
-        var nextCents = cents.slice();
-        nextCents.splice(bi, 1, next[0], next[1]);
-        var nextPalette = distinctPalette(nextCents);
-        if (nextPalette.length <= palette.length || nextPalette.length > colorBudget) continue;
-        bestIdx = bi; bestGain = gain; bestSplit = halves; bestCents = nextCents; bestPalette = nextPalette;
+        if (maxR2 < stopRadiusSq) continue;
+        if (sse > bestSse) {
+          bestSse = sse; bestIdx = bi;
+          bestAxis = (v0 >= v1 && v0 >= v2) ? 0 : (v1 >= v2 ? 1 : 2);
+        }
       }
       if (bestIdx < 0) break;
-      boxes.splice(bestIdx, 1, bestSplit[0], bestSplit[1]);
-      cents = bestCents;
-      palette = bestPalette;
+      var target = boxes.splice(bestIdx, 1)[0];
+      target.sort(function(a, b){ return a.lab[bestAxis] - b.lab[bestAxis]; });
+      var tw = 0;
+      for (var t = 0; t < target.length; t++) tw += target[t].w;
+      var half = tw / 2, acc = 0, split = 1;
+      for (var t2 = 0; t2 < target.length - 1; t2++) {
+        acc += target[t2].w;
+        if (acc >= half) { split = t2 + 1; break; }
+      }
+      boxes.push(target.slice(0, split), target.slice(split));
     }
-    return palette;
+
+    return boxes.map(boxCentroid);
+  }
+
+  function faceColorRegion(data, width, height, box){
+    var left = width, right = -1, top = height, bottom = -1, count = 0;
+    var first = box.minY + Math.floor(box.bh * 0.30);
+    var last = box.minY + Math.floor(box.bh * 0.63);
+    for (var y = first; y <= last; y++) {
+      for (var x = box.minX; x <= box.maxX; x++) {
+        var p = (y * width + x) * 4;
+        var r = data[p], g = data[p + 1], b = data[p + 2];
+        if (data[p + 3] < 128 || r < 110 || r - g < 13 || r - b < 19) continue;
+        left = Math.min(left, x); right = Math.max(right, x);
+        top = Math.min(top, y); bottom = Math.max(bottom, y);
+        count++;
+      }
+    }
+    // The skin gives the lower face and its shadows. Expand upward for the
+    // eye line, including eyes surrounded by a fringe instead of skin.
+    if (count < 3 || right - left + 1 > box.bw * 0.8 || bottom - top + 1 > box.bh * 0.28) return null;
+    return { left: Math.max(0, left - 1), right: Math.min(width - 1, right + 1),
+      top: Math.max(0, top - Math.max(2, Math.round(box.bh * 0.09))), bottom: Math.min(height - 1, bottom + 1) };
+  }
+
+  function inFaceRegion(face, x, y){
+    return face && x >= face.left && x <= face.right && y >= face.top && y <= face.bottom;
+  }
+
+  function closestPaletteIndex(lab, palette){
+    var best = 0, bestDistance = Infinity;
+    for (var i = 0; i < palette.length; i++) {
+      var distance = oklabWeightedDistSq(lab, palette[i].lab);
+      if (distance < bestDistance) { best = i; bestDistance = distance; }
+    }
+    return best;
   }
 
   function paletteIndices(canvas, palette){
@@ -2506,79 +2651,57 @@ img{display:block;max-width:100%}
     ];
   }
 
-  function cleanPalettePixels(canvas, palette, standing, outline){
+  function cleanPalettePixels(canvas, palette, standing, outline, face){
     if (!palette || !palette.length) return;
     var frame = paletteIndices(canvas, palette);
     var w = frame.width, h = frame.height, indices = frame.indices;
-    var distances = palette.map(function(a){
-      return palette.map(function(b){ return oklabWeightedDistSq(a.lab, b.lab); });
+    var nearShade = palette.map(function(a){
+      return palette.map(function(b){
+        // A small lightness change is enough for a correction. Keep changes
+        // between different chroma or hue out of the neighborhood vote.
+        return oklabDistSq(a.lab, b.lab) <= 0.052 * 0.052 &&
+          Math.hypot(a.lab[1] - b.lab[1], a.lab[2] - b.lab[2]) <= 0.025;
+      });
     });
     var outlineIndex = outline ? palette.findIndex(function(entry){
       return entry.rgb.every(function(c, i){ return c === outline[i]; });
     }) : -1;
-    var close = 0.20 * 0.20, detail = 0.13 * 0.13;
-    for (var pass = 0; pass < 3; pass++) {
-      var next = indices.slice();
-      var changed = false;
-      for (var y = 1; y < h - 1; y++) {
-        for (var x = 1; x < w - 1; x++) {
-          var p = y * w + x, color = indices[p];
-          if (color < 0 || color === outlineIndex) continue;
-          var sides = paletteNeighbors(indices, w, h, x, y);
-          var solid = sides.filter(function(i){ return i >= 0; });
-          if (solid.length < 3) continue;
-          var nearby = distances[color];
-          var corners = [indices[p - w - 1], indices[p - w + 1], indices[p + w - 1], indices[p + w + 1]];
-          var ownSides = solid.filter(function(i){ return i === color; }).length;
-          // Preserve isolated eyes and narrow strokes whose contrast separates
-          // them from the surrounding material, including diagonal strokes.
-          if (!solid.some(function(i){ return nearby[i] <= close; })) continue;
-          var horizontal = sides[0] === color && sides[1] === color;
-          var vertical = sides[2] === color && sides[3] === color;
-          var diagonal = (corners[0] === color && corners[3] === color) || (corners[1] === color && corners[2] === color);
-          if (!ownSides && !diagonal) {
-            diagonal = corners.some(function(corner, i){
-              if (corner !== color) return false;
-              var dx = i % 2 ? 2 : -2, dy = i < 2 ? -2 : 2;
-              return x + dx >= 0 && x + dx < w && y + dy >= 0 && y + dy < h &&
-                indices[p + dy * w + dx] === color;
-            });
-          }
-          if ((ownSides === 2 && (horizontal || vertical) && !corners.includes(color)) ||
-              (!ownSides && diagonal)) continue;
+    var offsetX = standing ? Math.floor(standing.width / 2) - Math.floor(w / 2) : 0;
+    var offsetY = standing ? standing.height - h : 0;
+    var next = indices.slice();
+    for (var y = 1; y < h - 1; y++) {
+      for (var x = 1; x < w - 1; x++) {
+        var p = y * w + x, color = indices[p];
+        if (color < 0 || color === outlineIndex || inFaceRegion(face, x, y)) continue;
+        var sides = paletteNeighbors(indices, w, h, x, y);
+        var solid = sides.filter(function(i){ return i >= 0; });
+        if (solid.length < 3 || !solid.every(function(i){ return nearShade[color][i]; })) continue;
+        var ownSides = solid.filter(function(i){ return i === color; }).length;
+        var corners = [indices[p - w - 1], indices[p - w + 1], indices[p + w - 1], indices[p + w + 1]];
+        if ((sides[0] === color && sides[1] === color) || (sides[2] === color && sides[3] === color) ||
+            (corners[0] === color && corners[3] === color) || (corners[1] === color && corners[2] === color)) continue;
 
-          var best = color;
-          if (!ownSides) {
-            var bestScore = 0;
-            solid.forEach(function(candidate){
-              if (nearby[candidate] > close) return;
-              var sideVotes = solid.filter(function(i){ return i === candidate; }).length;
-              var cornerVotes = corners.filter(function(i){ return i === candidate; }).length;
-              if (sideVotes < 2 && cornerVotes < 1 &&
-                  solid.some(function(i){ return distances[candidate][i] > close; })) return;
-              var score = 2 * sideVotes + cornerVotes - 15 * nearby[candidate];
-              if (score > bestScore) { best = candidate; bestScore = score; }
-            });
-          }
-
-          // Stand and walk canvases share the horizontal center and foot line.
-          // Match close levels when both poses support that shade locally.
-          if (standing && ownSides < 3) {
-            var sx = x + Math.floor(standing.width / 2) - Math.floor(w / 2), sy = y + standing.height - h;
-            if (sx >= 0 && sx < standing.width && sy >= 0 && sy < standing.height) {
-              var ref = standing.indices[sy * standing.width + sx];
-              if (ref >= 0 && ref !== outlineIndex && nearby[ref] <= detail && solid.includes(ref) &&
-                  paletteNeighbors(standing.indices, standing.width, standing.height, sx, sy).includes(ref)) {
-                best = ref;
-              }
-            }
-          }
-          if (best !== color) { next[p] = best; changed = true; }
+        var replacement = color;
+        if (!ownSides) {
+          var majority = solid.find(function(candidate){
+            return solid.filter(function(i){ return i === candidate; }).length > solid.length / 2;
+          });
+          if (majority !== undefined) replacement = majority;
         }
+        if (standing) {
+          var sx = x + offsetX, sy = y + offsetY;
+          if (sx >= 0 && sx < standing.width && sy >= 0 && sy < standing.height) {
+            var ref = standing.indices[sy * standing.width + sx];
+            if (ref >= 0 && ref !== outlineIndex && nearShade[color][ref] &&
+                solid.filter(function(i){ return i === ref; }).length >= 2 &&
+                paletteNeighbors(standing.indices, standing.width, standing.height, sx, sy)
+                  .filter(function(i){ return i === ref; }).length >= 2) replacement = ref;
+          }
+        }
+        next[p] = replacement;
       }
-      indices = next;
-      if (!changed) break;
     }
+    indices = next;
     var ctx = canvas.getContext('2d', { willReadFrequently: true });
     var img = ctx.getImageData(0, 0, w, h);
     for (var p = 0; p < indices.length; p++) {
@@ -2594,6 +2717,11 @@ img{display:block;max-width:100%}
     var img = ctx.getImageData(0, 0, canvas.width, canvas.height);
     var d = img.data;
     var cache = new Map();
+    var lookup = palette.flatMap(function(entry){
+      return [entry.lab].concat(entry.aliases || []).map(function(lab){
+        return { lab: lab, rgb: entry.rgb };
+      });
+    });
     for (var i = 0; i < d.length; i += 4) {
       if (d[i + 3] < 16) {
         d[i] = 0; d[i + 1] = 0; d[i + 2] = 0; d[i + 3] = 0;
@@ -2603,12 +2731,7 @@ img{display:block;max-width:100%}
       var key = (r << 16) | (g << 8) | b;
       var best = cache.get(key);
       if (!best) {
-        var lab = rgbToOklab(r, g, b);
-        var bd = 1e9;
-        for (var j = 0; j < palette.length; j++) {
-          var dist = oklabWeightedDistSq(lab, palette[j].lab);
-          if (dist < bd) { bd = dist; best = palette[j].rgb; }
-        }
+        best = lookup[closestPaletteIndex(rgbToOklab(r, g, b), lookup)].rgb;
         cache.set(key, best);
       }
       d[i] = best[0]; d[i + 1] = best[1]; d[i + 2] = best[2];
@@ -2618,8 +2741,13 @@ img{display:block;max-width:100%}
 
   function finishPaletteFrame(canvas, palette, alphaThreshold, standing, outline){
     binaryAlpha(canvas, alphaThreshold);
+    if (!palette || !palette.length) return;
+    var box = findBoundingBox(canvas);
+    var ctx = canvas.getContext('2d', { willReadFrequently: true });
+    var d = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    var face = box && faceColorRegion(d, canvas.width, canvas.height, box);
     applyPaletteToCanvas(canvas, palette);
-    return cleanPalettePixels(canvas, palette, standing, outline);
+    return cleanPalettePixels(canvas, palette, standing, outline, face);
   }
 
   function resolvePaletteOutline(pp, palette){
@@ -2730,14 +2858,407 @@ img{display:block;max-width:100%}
 
   function makeOutputPalette(canvases, pp){
     if (!pp.paletteCount) return null;
-    var reserved = [];
-    var features = lockedFeatureColors(canvases, Math.min(6, Math.floor(pp.paletteCount / 4)));
-    if (pp.outline) features.unshift(hexToRgb(pp.outlineColor));
-    features.forEach(function(rgb){
-      var lab = rgbToOklab(rgb[0], rgb[1], rgb[2]);
-      if (!reserved.some(function(other){ return samePaletteShade(lab, other.lab); })) reserved.push({ rgb: rgb, lab: lab });
+    var reserved = pp.outline ? [hexToRgb(pp.outlineColor)] : [];
+    lockedFeatureColors(canvases, Math.min(6, Math.floor(pp.paletteCount / 4))).forEach(function(rgb){
+      if (!reserved.some(function(other){ return rgb.every(function(c, i){ return c === other[i]; }); })) reserved.push(rgb);
     });
-    return buildUnifiedPaletteOklab(canvases, pp.paletteCount, reserved);
+    var candidates = reserved.map(function(rgb){ return { rgb: rgb, lab: rgbToOklab(rgb[0], rgb[1], rgb[2]) }; })
+      .concat(buildUnifiedPaletteOklab(canvases, pp.paletteCount - reserved.length));
+    var weights = new Float64Array(candidates.length);
+    var cache = new Map();
+    canvases.forEach(function(canvas){
+      if (!canvas) return;
+      var box = findBoundingBox(canvas);
+      if (!box) return;
+      var w = canvas.width, h = canvas.height;
+      var d = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data;
+      var face = faceColorRegion(d, w, h, box);
+      for (var y = box.minY; y <= box.maxY; y++) {
+        for (var x = box.minX; x <= box.maxX; x++) {
+          var p = (y * w + x) * 4;
+          if (d[p + 3] < 16) continue;
+          var key = (d[p] << 16) | (d[p + 1] << 8) | d[p + 2];
+          var i = cache.get(key);
+          if (i === undefined) {
+            i = closestPaletteIndex(rgbToOklab(d[p], d[p + 1], d[p + 2]), candidates);
+            cache.set(key, i);
+          }
+          weights[i] += inFaceRegion(face, x, y) ? 4 : 1;
+        }
+      }
+    });
+    var order = candidates.map(function(_, i){ return i; });
+    var palette = pp.outline ? [candidates[order.shift()]] : [];
+    // Prefer the swatch actually used by the face when two swatches compete
+    // for the same shade. A rare iris must not lose to a large garment.
+    order.sort(function(a, b){ return weights[b] - weights[a]; }).forEach(function(i){
+      var entry = candidates[i], closest = null, minDistance = Infinity;
+      palette.forEach(function(other){
+        if (!samePaletteShade(entry.lab, other.lab)) return;
+        var distance = oklabDistSq(entry.lab, other.lab);
+        if (distance < minDistance) { minDistance = distance; closest = other; }
+      });
+      if (!closest) palette.push(entry);
+      else {
+        // Keep the removed centroid as a lookup point. Its source pixels
+        // resolve to this close swatch instead of jumping to a remote color.
+        if (!closest.aliases) closest.aliases = [];
+        closest.aliases.push(entry.lab);
+      }
+    });
+    return palette;
+  }
+
+  function lockRaster(image){
+    var d = image.data;
+    return Int32Array.from({ length: d.length / 4 }, function(_, p){
+      var o = p * 4;
+      return d[o + 3] ? (d[o] << 16) | (d[o + 1] << 8) | d[o + 2] : -1;
+    });
+  }
+
+  function lockPixel(pixels, w, h, x, y){
+    return x >= 0 && x < w && y >= 0 && y < h ? pixels[y * w + x] : -1;
+  }
+
+  function lockRgbDistance(a, b){
+    if (a === b) return 0;
+    if (a < 0 || b < 0) return Infinity;
+    return Math.hypot((a >> 16) - (b >> 16), ((a >> 8) & 255) - ((b >> 8) & 255), (a & 255) - (b & 255));
+  }
+
+  function lockShift(step, ref, limitY, cutoff, threshold){
+    var w = step.width, h = step.height;
+    var top = step.box.minY, last = Math.min(step.box.maxY, top + Math.floor(step.box.bh * cutoff));
+    var best = { x: 0, y: 0 }, score = Infinity;
+    for (var dy = -limitY; dy <= limitY; dy++) {
+      if (ref.box.minY - dy < 0) continue;
+      for (var dx = -2; dx <= 2; dx++) {
+        if (ref.box.minX - dx < 0 || ref.box.maxX - dx >= w) continue;
+        var cost = 0.1 * (Math.abs(dx) + Math.abs(dy));
+        for (var y = top; y <= last; y++) {
+          for (var x = 0; x < w; x++) {
+            var expected = lockPixel(ref.pixels, ref.width, ref.height, x + dx, y + dy);
+            if (lockRgbDistance(step.pixels[y * w + x], expected) > threshold) cost++;
+          }
+        }
+        if (cost < score) { best = { x: dx, y: dy }; score = cost; }
+      }
+    }
+    return best;
+  }
+
+  function lockFrame(canvas){
+    var data = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, canvas.width, canvas.height);
+    var box = findBoundingBox(canvas);
+    return box && { width: canvas.width, height: canvas.height, box: box, pixels: lockRaster(data),
+      face: faceColorRegion(data.data, canvas.width, canvas.height, box) };
+  }
+
+  var lockBodyUrl = '', lockBodyFrames = null;
+  function loadLockBody(body){
+    if (!body) return Promise.resolve(null);
+    if (body.dataUrl !== lockBodyUrl) {
+      lockBodyUrl = body.dataUrl;
+      lockBodyFrames = loadImg(body.dataUrl).then(function(im){
+        var w = Math.round(im.width / 3), h = Math.round(im.height / 4);
+        var cell = document.createElement('canvas'); cell.width = w; cell.height = h;
+        var ctx = cell.getContext('2d', { willReadFrequently: true });
+        return Array.from({ length: 12 }, function(_, i){
+          ctx.clearRect(0, 0, w, h);
+          ctx.drawImage(im, i % 3 * w, Math.floor(i / 3) * h, w, h, 0, 0, w, h);
+          return lockFrame(cell);
+        });
+      });
+    }
+    return lockBodyFrames;
+  }
+
+  function lockSpan(pixels, width, y){
+    if (y < 0 || y >= pixels.length / width) return [1, 0];
+    var lo = 0, hi = width - 1, off = y * width;
+    while (lo < width && pixels[off + lo] < 0) lo++;
+    while (hi >= lo && pixels[off + hi] < 0) hi--;
+    return [lo, hi];
+  }
+
+  function lockMotionMask(step, standing, ref, shift, bodyStep, bodyStand, direction){
+    var w = step.width, h = step.height, box = step.box;
+    var motion = new Uint8Array(w * h);
+    if (!bodyStep || !bodyStand) {
+      var base = Math.ceil(box.minY + box.bh * 0.55) * w;
+      motion.fill(1, base);
+    } else {
+      var b = bodyStep.box, s = bodyStand.box;
+      var bodyShift = lockShift(bodyStep, bodyStand, 1, 0.45, 18);
+      var neck = Math.floor(s.minY + s.bh * 0.39), neckWidth = Infinity;
+      for (var y = neck; y <= s.minY + s.bh * 0.56; y++) {
+        var span = lockSpan(bodyStand.pixels, bodyStand.width, y), width = span[1] - span[0] + 1;
+        if (width > 0 && width < neckWidth) { neck = y; neckWidth = width; }
+      }
+      var scale = box.bh / b.bh;
+      for (var p = 0; p < motion.length; p++) {
+        var x = p % w, y = Math.floor(p / w);
+        var bx = Math.round((b.minX + b.maxX) / 2 + (x - (box.minX + box.maxX) / 2) / scale);
+        var by = Math.round(b.maxY + (y - box.maxY) / scale);
+        if (by + bodyShift.y < neck) continue;
+        var current = lockPixel(bodyStep.pixels, bodyStep.width, bodyStep.height, bx, by);
+        var base = lockPixel(bodyStand.pixels, bodyStand.width, bodyStand.height, bx + bodyShift.x, by + bodyShift.y);
+        var hem = (direction === 1 || direction === 2) && y >= box.minY + box.bh * 0.64 && (step.pixels[p] >= 0) !== (standing[p] >= 0);
+        if (hem || lockRgbDistance(current, base) > 18) motion[p] = 1;
+      }
+      if (direction === 0) {
+        var mid = (box.minX + box.maxX) / 2, outer = box.bw * 0.19;
+        for (var y = Math.ceil(box.minY + box.bh * 0.54); y <= box.minY + box.bh * 0.80; y++) {
+          var leftMoves = false, rightMoves = false;
+          for (var x = box.minX; x <= box.maxX; x++) {
+            if (x < mid - 1 && motion[y * w + x]) leftMoves = true;
+            if (x > mid + 1 && motion[y * w + x]) rightMoves = true;
+          }
+          // Sleeves and hands can extend beyond the unclothed template.
+          // Extend each moving arm toward the sprite's own outer silhouette.
+          for (var x = 0; x < w; x++) {
+            var p = y * w + x;
+            if ((x <= mid - outer && leftMoves || x >= mid + outer && rightMoves) &&
+                (step.pixels[p] >= 0 || standing[p] >= 0)) motion[p] = 1;
+          }
+        }
+      }
+      var spread = motion.slice();
+      motion.forEach(function(active, p){
+        if (!active) return;
+        var x = p % w, y = Math.floor(p / w);
+        for (var dy = -1; dy <= 1; dy++) {
+          for (var dx = -1; dx <= 1; dx++) {
+            if (x + dx >= 0 && x + dx < w && y + dy >= 0 && y + dy < h) spread[p + dy * w + dx] = 1;
+          }
+        }
+      });
+      motion = spread;
+    }
+    motion.forEach(function(active, p){
+      var x = p % w, y = Math.floor(p / w);
+      if (active && (inFaceRegion(step.face, x, y) || inFaceRegion(ref.face, x + shift.x, y + shift.y))) motion[p] = 0;
+    });
+    return motion;
+  }
+
+  function fitLockSeam(step, standing, boundary){
+    var w = step.width, h = step.height, b = step.box;
+    var fits = [];
+    for (var dy = -1; dy <= 1; dy++) {
+      if (b.maxY - dy >= h || b.minY - dy < 0) continue;
+      for (var dx = -2; dx <= 2; dx++) {
+        if (b.minX - dx < 0 || b.maxX - dx >= w) continue;
+        var fit = 0, count = 0, cost = 0;
+        for (var y = boundary - 2; y <= boundary + 2; y++) {
+          var a = lockSpan(step.pixels, w, y + dy), r = lockSpan(standing, w, y);
+          if (a[1] < a[0] || r[1] < r[0]) continue;
+          count++;
+          var left = Math.abs(a[0] - dx - r[0]), right = Math.abs(a[1] - dx - r[1]);
+          if (left <= 2 && right <= 2 && Math.abs((a[1] - a[0]) - (r[1] - r[0])) <= 2) fit++;
+          cost += left + right;
+        }
+        if (!count || fit < Math.ceil(count * 0.6)) continue;
+        var score = cost / count + Math.abs(dx) * 0.65 + Math.abs(dy) * 1.25;
+        fits.push({ x: dx, y: dy, score: dx || dy ? score : -1 });
+      }
+    }
+    return fits.sort(function(a,b){ return a.score-b.score; });
+  }
+
+  function repairLockSeam(pixels, active, standing, step, w, h){
+    var neighbors = Array.from({ length: pixels.length }, function(_, p){
+      var x = p % w, y = Math.floor(p / w);
+      return [x ? p - 1 : -1, x < w - 1 ? p + 1 : -1, y ? p - w : -1, y < h - 1 ? p + w : -1];
+    });
+    var seam = active.map(function(v, p){
+      return v && neighbors[p].some(function(q){ return q >= 0 && !active[q] && (pixels[q] >= 0 || standing[p] >= 0); });
+    });
+    var out = pixels.slice();
+    var recolored = 0, filled = 0, removed = 0, remainingGaps = 0;
+    function joinAt(p){
+      var n = neighbors[p];
+      return [[n[0], n[1]], [n[2], n[3]]].find(function(pair){
+        return pair.every(function(q){ return q >= 0 && pixels[q] >= 0; }) && !!active[pair[0]] !== !!active[pair[1]];
+      });
+    }
+    seam.forEach(function(v, p){
+      if (!v) return;
+      var n = neighbors[p].filter(function(q){ return q >= 0; });
+      var solid = n.filter(function(q){ return pixels[q] >= 0; });
+      var edge = solid.length < n.length;
+      if (pixels[p] < 0) {
+        var pair = joinAt(p);
+        if (!pair || standing[p] < 0 || solid.length < 3) return;
+        var donor = pair.find(function(q){ return !active[q]; });
+        var moving = pair.find(function(q){ return active[q]; });
+        var a = pixels[donor], b = pixels[moving];
+        var shade = function(color){ return (color >> 16) + 2 * ((color >> 8) & 255) + (color & 255); };
+        // Bridge the contour with an existing outline shade. Only fill a
+        // three-sided notch also supported by the standing silhouette.
+        out[p] = lockRgbDistance(a, b) <= 38 || shade(a) <= shade(b) ? a : b;
+        filled++;
+        return;
+      }
+      if (solid.length < 2 || solid.every(function(q){ return lockRgbDistance(pixels[p], pixels[q]) > 40; })) return;
+      var shared = solid.find(function(q){
+        if (active[q] || pixels[q] === pixels[p] || lockRgbDistance(pixels[p], pixels[q]) > 32) return false;
+        if (edge && !neighbors[q].some(function(k){ return k >= 0 && pixels[k] < 0; })) return false;
+        return solid.some(function(k){ return active[k] && pixels[k] === pixels[q]; });
+      });
+      if (shared !== undefined && !solid.some(function(q){ return pixels[q] === pixels[p]; })) {
+        out[p] = pixels[shared]; recolored++;
+      }
+    });
+    // Isolated new points and one-pixel-wide tails may come from joining
+    // different outlines. Remove only active-side fragments near the join or sole.
+    var contact = seam.slice();
+    seam.forEach(function(v, p){ if (v) neighbors[p].forEach(function(q){ if (q >= 0) contact[q] = 1; }); });
+    var mask = out.slice();
+    var small = new Set();
+    out.forEach(function(color, p){
+      if (color < 0 || !active[p] || small.has(p)) return;
+      var sole = Math.floor(p / w) >= step.box.minY + step.box.bh * 0.78;
+      if (!contact[p] && !sole) return;
+      var next = neighbors[p].filter(function(q){ return q >= 0 && mask[q] >= 0; });
+      if (next.length > 1) return;
+      var chain = [p], q = next[0];
+      while (q !== undefined && active[q] && chain.length < 4) {
+        var siblings = neighbors[q].filter(function(i){ return i >= 0 && mask[i] >= 0 && !chain.includes(i); });
+        if (siblings.length > 1) break;
+        chain.push(q);
+        q = siblings[0];
+      }
+      if (chain.length === 4 || (sole && chain.length < 2)) return;
+      if (chain.some(function(i){ return standing[i] >= 0 && !contact[i]; })) return;
+      // A diagonal continuation is part of the silhouette, not debris.
+      var witnessed = chain.some(function(i){
+        var x = i % w, y = Math.floor(i / w);
+        return [-1, 1].some(function(dy){ return [-1, 1].some(function(dx){
+          var k = (y + dy) * w + x + dx;
+          return lockPixel(mask, w, h, x + dx, y + dy) >= 0 && k !== q && !chain.includes(k) &&
+            (q === undefined || !neighbors[q].includes(k));
+        }); });
+      });
+      if (!witnessed) { chain.forEach(function(i){ small.add(i); }); removed++; }
+    });
+    small.forEach(function(p){ out[p] = -1; });
+    var seen = new Uint8Array(out.length), islands = 0, split = false;
+    out.forEach(function(color, p){
+      if (color < 0 || seen[p]) return;
+      var component = [p];
+      seen[p] = 1;
+      for (var i = 0; i < component.length; i++) {
+        var q = component[i], x = q % w, y = Math.floor(q / w);
+        for (var dy = -1; dy <= 1; dy++) {
+          for (var dx = -1; dx <= 1; dx++) {
+            var k = q + dy * w + dx;
+            if (lockPixel(out, w, h, x + dx, y + dy) < 0 || seen[k]) continue;
+            seen[k] = 1; component.push(k);
+          }
+        }
+      }
+      var activeOnly = component.every(function(q){ return active[q]; });
+      if (component.length <= 4 && activeOnly) {
+        component.forEach(function(q){ out[q] = -1; });
+        removed++;
+      } else if (component.some(function(q){ return contact[q]; })) {
+        if (component.length <= 4) islands++;
+        else if (activeOnly) split = true;
+      }
+    });
+    seam.forEach(function(v, p){
+      if (!v || out[p] >= 0 || standing[p] < 0) return;
+      var n = neighbors[p];
+      var solid = n.filter(function(q){ return q >= 0 && out[q] >= 0; });
+      if (solid.length >= 3 && [[n[0], n[1]], [n[2], n[3]]].some(function(pair){
+        return pair.every(function(q){ return q >= 0 && out[q] >= 0; }) && !!active[pair[0]] !== !!active[pair[1]];
+      })) remainingGaps++;
+    });
+    return { pixels: out, recolored: recolored, filled: filled, removed: removed, gaps: remainingGaps, islands: islands, split: split };
+  }
+
+  function joinLockedFrame(canvas, refCanvas, bodyStep, bodyStand, direction){
+    var step = lockFrame(canvas), ref = lockFrame(refCanvas);
+    if (!step || !ref) return null;
+    var w = step.width, h = step.height, shift = lockShift(step, ref, 1, 0.60, 30);
+    if (ref.box.minY - shift.y < 0 || ref.box.minX - shift.x < 0 || ref.box.maxX - shift.x >= w) {
+      return { suggested: true, shift: shift };
+    }
+    var standing = Int32Array.from(step.pixels, function(_, p){
+      return lockPixel(ref.pixels, ref.width, ref.height, p % w + shift.x, Math.floor(p / w) + shift.y);
+    });
+    var boundary = Math.floor(ref.box.minY + ref.box.bh * 0.55) - shift.y;
+    var fits = fitLockSeam(step, standing, boundary);
+    var result;
+    fits.some(function(fit){
+      var pose = Object.assign({}, step);
+      pose.pixels = Int32Array.from(step.pixels, function(_, p){
+        return lockPixel(step.pixels, w, h, p % w + fit.x, Math.floor(p / w) + fit.y);
+      });
+      pose.box = Object.assign({}, step.box, {
+        minX: step.box.minX - fit.x, maxX: step.box.maxX - fit.x,
+        minY: step.box.minY - fit.y, maxY: step.box.maxY - fit.y
+      });
+      if (step.face) pose.face = { left: step.face.left - fit.x, right: step.face.right - fit.x,
+        top: step.face.top - fit.y, bottom: step.face.bottom - fit.y };
+      var active = lockMotionMask(pose, standing, ref, shift, bodyStep, bodyStand, direction);
+      var joined = Int32Array.from(pose.pixels, function(color, p){ return active[p] ? color : standing[p]; });
+      // Keep an active pose attached to a real silhouette. Do not commit a
+      // candidate whose join has too little solid overlap across its boundary.
+      var connected = active.some(function(v, p){
+        return v && joined[p] >= 0 && p >= w && !active[p - w] && joined[p - w] >= 0;
+      });
+      if (!connected) return false;
+      var repaired = repairLockSeam(joined, active, standing, pose, w, h);
+      if (repaired.split || repaired.gaps || repaired.islands) return false;
+      var ctx = canvas.getContext('2d', { willReadFrequently: true }), out = ctx.createImageData(w, h);
+      repaired.pixels.forEach(function(color, p){
+        if (color >= 0) out.data.set([color >> 16, (color >> 8) & 255, color & 255, 255], p * 4);
+      });
+      ctx.putImageData(out, 0, 0);
+      result = { shift: shift, activeShift: { x: fit.x, y: fit.y }, filled: repaired.filled, removed: repaired.removed,
+        recolored: repaired.recolored, gaps: repaired.gaps, islands: repaired.islands, active: active };
+      return true;
+    });
+    return result || { suggested: true, shift: shift };
+  }
+
+
+  var lockRefresh = 0;
+  async function refreshBodyLocks(rows){
+    var version = ++lockRefresh;
+    var targets = rows || [0, 1, 2, 3];
+    var indices = targets.reduce(function(list, row){ return list.concat([row * 3, row * 3 + 1, row * 3 + 2]); }, []);
+    var diagnostics = state.lockResults.slice();
+    var originals = indices.map(function(i){ return state.edited[i] ? state.frames[i] : state.unlockedFrames[i]; });
+    var enabled = state.pp.lockUpper;
+    var body = enabled && originals.some(Boolean) ? getSelectedBaseBody() : null;
+    var assets = enabled ? await Promise.all([loadLockBody(body), Promise.all(originals.map(function(url){
+      return url ? loadImg(url).then(function(im){
+        var c = document.createElement('canvas'); c.width = im.width; c.height = im.height;
+        c.getContext('2d').drawImage(im, 0, 0);
+        return c;
+      }) : null;
+    }))]) : [];
+    if (version !== lockRefresh) return;
+
+    indices.forEach(function(i, j){
+      diagnostics[i] = null;
+      if (state.edited[i]) return;
+      state.frames[i] = originals[j];
+      if (!enabled || i % 3 === 1 || !originals[j]) return;
+      var stand = i + 1 - i % 3;
+      var bodyFrames = assets[0], canvases = assets[1];
+      var ref = canvases[j + stand - i];
+      if (!ref) return;
+      diagnostics[i] = joinLockedFrame(canvases[j], ref, bodyFrames && bodyFrames[i], bodyFrames && bodyFrames[stand],
+        Math.floor(i / 3));
+      if (diagnostics[i] && !diagnostics[i].suggested) state.frames[i] = canvases[j].toDataURL('image/png');
+    });
+    state.lockResults = diagnostics;
+    if (lastNativeStats) lastNativeStats.locks = diagnostics;
   }
 
   var lastNativeStats = null;
@@ -2788,6 +3309,28 @@ img{display:block;max-width:100%}
     el.appendChild(actions);
   }
 
+  function snapSourceGroup(group, source, size){
+    var height = source && (source.height || source);
+    var mode = source && source.size === size ? source.mode : null;
+    var detected;
+    if (mode !== 'body') {
+      var shared = {
+        sx: sharedAxisPeriod(group.map(function(it){ return it.grid.x; })),
+        sy: sharedAxisPeriod(group.map(function(it){ return it.grid.y; }))
+      };
+      detected = group.map(function(it){
+        return snapFrameToNativePixelArt(it.canvas, it.bbox, shared, it.grid) || it;
+      });
+      // Strict export allows the full cell. A one/two-pixel overrun can
+      // preserve useful native details, but systematic finer grids cannot.
+      if (!mode && height) mode = detected.some(function(it){ return it.bbox.bh > size + 2; }) ? 'body' : 'detected';
+    }
+    var frames = mode === 'body' ? group.map(function(it){
+      return snapFrameToNativePixelArt(it.canvas, it.bbox, { bodyStep: height / size }, it.grid) || it;
+    }) : detected;
+    return { frames: frames, setting: height ? { height: height, mode: mode, size: size } : null };
+  }
+
   async function processFrames(input, pp, frozenPalette){
     var size = pp.size;
     var items = await Promise.all(input.rawFrames.map(async function(raw, i){
@@ -2805,21 +3348,19 @@ img{display:block;max-width:100%}
     }));
 
     var groups = new Map();
+    var bodyCellHeights = Object.assign({}, input.bodyCellHeights);
     items.forEach(function(item, i){
       if (!item || !item.grid) return;
       var key = (input.sources[i] || 'cell_' + i).replace(/_r\d+$/, '');
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(i);
     });
-    groups.forEach(function(indices){
-      var shared = {
-        sx: sharedAxisPeriod(indices.map(function(i){ return items[i].grid.x; })),
-        sy: sharedAxisPeriod(indices.map(function(i){ return items[i].grid.y; }))
-      };
-      indices.forEach(function(i){
-        var it = items[i];
-        items[i] = snapFrameToNativePixelArt(it.canvas, it.bbox, shared, it.grid) || it;
-      });
+    groups.forEach(function(indices, key){
+      var source = bodyCellHeights[key];
+      var group = indices.map(function(i){ return items[i]; });
+      var chosen = snapSourceGroup(group, source, size);
+      if (chosen.setting) bodyCellHeights[key] = chosen.setting;
+      indices.forEach(function(i, j){ items[i] = chosen.frames[j]; });
     });
 
     var stats = { size: size, availH: size - 1 - pp.footMargin, availW: size - 2,
@@ -2851,7 +3392,7 @@ img{display:block;max-width:100%}
       if (it.snapped) stats.snappedCount++;
       if (scale < 1) stats.downscaledCount++;
       stats.maxNativeH = Math.max(stats.maxNativeH, b.bh);
-      stats.frames.push({ index: i, bw: b.bw, bh: b.bh, scale: scale, intPlace: scale === 1 && !blocked,
+      stats.frames.push({ index: i, bw: b.bw, bh: b.bh, bodyGrid: !!it.bodyGrid, scale: scale, intPlace: scale === 1 && !blocked,
         overflow: tooLarge, blocked: blocked, fidelity: 1, center: dx + center, foot: bottom - 1, phaseX: it.phaseX, phaseY: it.phaseY, stepX: it.stepX, stepY: it.stepY,
         coherence: it.coherence || 0, error: it.error === undefined ? 1 : it.error, removed: it.removed || [] });
       // Keep the original reference for unscaled steps when the user approves
@@ -2908,18 +3449,26 @@ img{display:block;max-width:100%}
       var finalBox = findBoundingBox(canvas);
       frame.foot = finalBox ? finalBox.maxY : 0;
     });
-    return { processed: processed, stats: stats, overflow: overflow, palette: palette,
+    return { processed: processed, stats: stats, overflow: overflow, palette: palette, bodyCellHeights: bodyCellHeights,
       output: inspectOutput(processed, pp), skippedEdited: input.edited.filter(Boolean).length };
   }
 
-  function commitProcessed(result){
-    state.overflow = result.overflow;
+  async function commitProcessed(result, rows){
+    var changed = function(i){ return !rows || rows.includes(Math.floor(i / 3)); };
+    state.overflow = state.overflow.filter(function(i){ return !changed(i); }).concat(result.overflow.filter(changed)).sort(function(a,b){ return a-b; });
     state.palette = result.palette;
+    state.bodyCellHeights = result.bodyCellHeights;
+    if (rows && lastNativeStats) {
+      result.stats.frames = result.stats.frames.filter(function(frame){ return changed(frame.index); })
+        .concat(lastNativeStats.frames.filter(function(frame){ return !changed(frame.index); }))
+        .sort(function(a,b){ return a.index-b.index; });
+    }
     lastNativeStats = result.stats;
     window.__lastNativeStats = lastNativeStats;
-    state.frames = result.processed.map(function(canvas, i){
-      return state.edited[i] ? state.frames[i] : canvas ? canvas.toDataURL('image/png') : '';
+    result.processed.forEach(function(canvas, i){
+      if (changed(i) && !state.edited[i]) state.unlockedFrames[i] = canvas ? canvas.toDataURL('image/png') : '';
     });
+    await refreshBodyLocks(rows);
     return result;
   }
 
@@ -3252,7 +3801,7 @@ img{display:block;max-width:100%}
     var styleText = state.styleDesc || 'pixel art, chibi RPG character sprite, crisp outline, full color';
     if (hasBaseBody && hasCharRef) {
       return [
-        'gif: 2D RPG Maker MZ character sprite sheet containing 12 frames in a precise grid of 4 rows x 3 columns, fixed orthographic camera, same character, same scale and same foot line across all 12 cells.',
+        'gif 对齐: 2D RPG Maker MZ character sprite sheet containing 12 frames in a precise grid of 4 rows x 3 columns, fixed orthographic camera, same character, same scale and same foot line across all 12 cells.',
         'Keep the character hairstyle, face, outfit, colors, accessories and pixel art style from the first image, and dress them onto the body silhouette and pose from the second image.',
         'Use the second image ONLY for body proportions, scale, placement, facing directions and walking stride poses; completely ignore the background of both reference images.',
         'The second image is an unclothed pose mannequin; do NOT copy its bald head, skin tone, or backdrop—fully draw the character hair and clothes from the first image on every frame.',
@@ -3264,7 +3813,7 @@ img{display:block;max-width:100%}
     }
     if (hasBaseBody && !hasCharRef) {
       return [
-        'gif: 2D RPG Maker MZ character sprite sheet containing 12 frames in a precise grid of 4 rows x 3 columns, fixed orthographic camera, same character, same scale and same foot line across all 12 cells.',
+        'gif 对齐: 2D RPG Maker MZ character sprite sheet containing 12 frames in a precise grid of 4 rows x 3 columns, fixed orthographic camera, same character, same scale and same foot line across all 12 cells.',
         'Draw the described character onto the body silhouette and pose from the reference base-body image.',
         'Use the reference image ONLY for body proportions, scale, placement, facing directions and walking stride poses; completely ignore its background.',
         'The reference image is an unclothed pose mannequin; do NOT copy its bald head, skin tone, or backdrop—fully draw the character hair and clothes on every frame.',
@@ -3275,7 +3824,7 @@ img{display:block;max-width:100%}
       ].join(' ');
     }
     return [
-      'gif: 2D RPG Maker MZ character sprite sheet containing 12 frames in a precise grid of 4 rows x 3 columns, fixed orthographic camera, same character, same scale and same foot line across all 12 cells.',
+      'gif 对齐: 2D RPG Maker MZ character sprite sheet containing 12 frames in a precise grid of 4 rows x 3 columns, fixed orthographic camera, same character, same scale and same foot line across all 12 cells.',
       'Row 1 facing down (front view), row 2 facing left (left profile), row 3 facing right (right profile), row 4 facing up (back view).',
       'Columns from left to right: left foot step, standing, right foot step.',
       'Character: ' + charText + '.',
@@ -3289,12 +3838,14 @@ img{display:block;max-width:100%}
       ? 'keep the exact character, hairstyle, outfit, colors and pixel art style from the first reference image'
       : 'keep the exact character, colors and pixel art style from the reference image');
     var styleText = state.styleDesc || 'pixel art, chibi RPG character sprite, crisp outline, full color';
+    var panelSpec = 'For a PNG contact sheet use a precise 2 by 2 grid of equal square cells, in reading order. The sprite must fit inside each square and fill about 93% of its height. For an animated GIF use the same square cell for each frame.';
     if (hasBaseBody && hasCharRef) {
       return [
-        'gif: 2D RPG Maker character walk cycle loop: left foot step, standing, right foot step, standing (4 frames in reading order), fixed camera, same character, consistent scale and same foot line.',
+        'gif 对齐: 2D RPG Maker character walk cycle loop: left foot step, standing, right foot step, standing (4 frames in reading order), fixed camera, same character, consistent scale and same foot line.',
         'Keep the character hairstyle, face, outfit, colors, accessories and pixel art style from the first image, and dress them onto the body row in the second image.',
         'Use the second image ONLY for body proportions, scale, placement, facing direction and walking stride poses; completely ignore the background of both reference images.',
         'The second image is an unclothed pose mannequin; do NOT copy its bald head, skin tone, or backdrop—fully draw the character hair and clothes from the first image on every frame.',
+        panelSpec,
         'Character: ' + charText + '.',
         'Direction: ' + DIR_EN[dirIdx] + '.',
         'Style: ' + styleText + ', ' + pixelSpecClause(hasBaseBody) + '.',
@@ -3303,10 +3854,11 @@ img{display:block;max-width:100%}
     }
     if (hasBaseBody && !hasCharRef) {
       return [
-        'gif: 2D RPG Maker character walk cycle loop: left foot step, standing, right foot step, standing (4 frames in reading order), fixed camera, same character, consistent scale and same foot line.',
+        'gif 对齐: 2D RPG Maker character walk cycle loop: left foot step, standing, right foot step, standing (4 frames in reading order), fixed camera, same character, consistent scale and same foot line.',
         'Draw the described character onto the body row in the reference base-body image.',
         'Use the reference image ONLY for body proportions, scale, placement, facing direction and walking stride poses; completely ignore its background.',
         'The reference image is an unclothed pose mannequin; do NOT copy its bald head, skin tone, or backdrop—fully draw the character hair and clothes on every frame.',
+        panelSpec,
         'Character: ' + charText + '.',
         'Direction: ' + DIR_EN[dirIdx] + '.',
         'Style: ' + styleText + ', ' + pixelSpecClause(hasBaseBody) + '.',
@@ -3314,7 +3866,7 @@ img{display:block;max-width:100%}
       ].join(' ');
     }
     return [
-      'gif: 2D RPG Maker character walk cycle loop: left foot step, standing, right foot step, standing (4 frames in reading order), fixed camera, same character, consistent scale and same foot line.',
+      'gif 对齐: 2D RPG Maker character walk cycle loop: left foot step, standing, right foot step, standing (4 frames in reading order), fixed camera, same character, consistent scale and same foot line.',
       'Character: ' + charText + '.',
       'Direction: ' + DIR_EN[dirIdx] + '.',
       'Style: ' + styleText + ', ' + pixelSpecClause(hasBaseBody) + '.',
@@ -3364,15 +3916,17 @@ img{display:block;max-width:100%}
     return variants;
   }
 
-  function extractVariantFrames(variant, expect4x3){
+  async function extractVariantFrames(variant, expect4x3){
     if (variant.pngSrc) {
-      return expect4x3
-        ? splitSheetAuto(variant.pngSrc, state.pp.bgMode, state.pp.bgTol, 4, 3, true)
-        : splitSheetAuto(variant.pngSrc, state.pp.bgMode, state.pp.bgTol);
+      var frames = expect4x3
+        ? await splitSheetAuto(variant.pngSrc, state.pp.bgMode, state.pp.bgTol, 4, 3, true)
+        : await splitSheetAuto(variant.pngSrc, state.pp.bgMode, state.pp.bgTol);
+      if (!variant.useBodyGrid || expect4x3 || !variant.gifSrc || frames.length === 3 || frames.length === 4) return frames;
     }
-    if (variant.gifBuf) return decodeGifBuffer(variant.gifBuf);
-    if (variant.gifSrc) return fetch(variant.gifSrc).then(function(r){ return r.arrayBuffer(); }).then(decodeGifBuffer);
-    return Promise.resolve([]);
+    var gifFrames = variant.gifBuf ? await decodeGifBuffer(variant.gifBuf) :
+      variant.gifSrc ? await fetch(variant.gifSrc).then(function(r){ return r.arrayBuffer(); }).then(decodeGifBuffer) : [];
+    if (variant.useBodyGrid && gifFrames.length) gifFrames.cellHeight = (await loadImg(gifFrames[0])).height;
+    return gifFrames;
   }
 
   function callSequenceApi(opts){
@@ -3703,22 +4257,15 @@ img{display:block;max-width:100%}
     });
   }
 
-  function extractCellFromRedrawVariant(variant, cellIndex){
-    var srcPromise = variant.pngSrc
-      ? Promise.resolve(variant.pngSrc)
-      : (variant.gifBuf ? decodeGifBuffer(variant.gifBuf).then(function(fs){ return fs[0] || ''; }) : Promise.resolve(''));
-    return srcPromise.then(function(src){
-      if (!src) return '';
-      return splitSheetAuto(src, state.pp.bgMode, state.pp.bgTol, 4, 3, true).then(function(frames){
-        if (frames.length === 12) return frames[cellIndex];
-        return splitSheetAuto(src, state.pp.bgMode, state.pp.bgTol).then(function(autoFrames){
-          if (autoFrames.length === 1) return autoFrames[0];
-          return splitSheetGrid(src, 4, 3).then(function(gridFrames){ return gridFrames[cellIndex] || ''; });
-        }).catch(function(){
-          return splitSheetGrid(src, 4, 3).then(function(gridFrames){ return gridFrames[cellIndex] || ''; });
-        });
-      });
-    });
+  async function extractCellFromRedrawVariant(variant, cellIndex){
+    var src = variant.pngSrc || (variant.gifBuf && (await decodeGifBuffer(variant.gifBuf))[0]);
+    if (!src) return null;
+    var frames = await splitSheetAuto(src, state.pp.bgMode, state.pp.bgTol, 4, 3, true);
+    if (frames.length === 12) return { url: frames[cellIndex], cellHeight: frames.sheetMeta.h / 4 };
+    var autoFrames = await splitSheetAuto(src, state.pp.bgMode, state.pp.bgTol);
+    if (autoFrames.length === 1) return { url: autoFrames[0], cellHeight: (await loadImg(src)).height };
+    var gridFrames = await splitSheetGrid(src, 4, 3);
+    return { url: gridFrames[cellIndex], cellHeight: (await loadImg(src)).height / 4 };
   }
 
   function getExistingBaselineBottom(excludeIndex){
@@ -3748,8 +4295,14 @@ img{display:block;max-width:100%}
     var ci = variant.targetCell;
     var pp = Object.assign({}, state.pp);
     var size = pp.size;
-    var rawCellUrl = await extractCellFromRedrawVariant(variant, ci);
-    if (!rawCellUrl) return null;
+    var extracted = await extractCellFromRedrawVariant(variant, ci);
+    if (!extracted || !extracted.url) return null;
+    var rawCellUrl = extracted.url;
+    var source = state.bodyCellHeights[(state.sources[ci] || '').replace(/_r\d+$/, '')];
+    var cellHeight = variant.useBodyGrid ? extracted.cellHeight : 0;
+    var bodySetting = cellHeight && (source && source.size === size
+      ? { height: cellHeight, mode: source.mode, size: size }
+      : cellHeight);
 
     var clean = removeBackground(await loadImg(rawCellUrl), pp.bgMode, pp.bgTol, pp.alphaThresh);
     var bbox = findBoundingBox(clean);
@@ -3757,8 +4310,14 @@ img{display:block;max-width:100%}
 
     var item = { canvas: clean, bbox: bbox };
     if (pp.pixelSnap) {
-      var grid = measureFrameGrid(clean, bbox);
-      item = snapFrameToNativePixelArt(clean, bbox, null, grid) || item;
+      item.grid = measureFrameGrid(clean, bbox);
+      if (bodySetting) {
+        var chosen = snapSourceGroup([item], bodySetting, size);
+        item = chosen.frames[0];
+        bodySetting = chosen.setting;
+      } else {
+        item = snapFrameToNativePixelArt(clean, bbox, null, item.grid) || item;
+      }
     }
 
     var b = item.bbox;
@@ -3859,7 +4418,7 @@ img{display:block;max-width:100%}
     }
 
     var frameStat = {
-      index: ci, bw: b.bw, bh: b.bh, scale: scale, intPlace: scale === 1 && !blocked,
+      index: ci, bw: b.bw, bh: b.bh, bodyGrid: !!item.bodyGrid, scale: scale, intPlace: scale === 1 && !blocked,
       overflow: tooLarge, blocked: blocked, fidelity: fidelity, center: dx + center, foot: footY,
       phaseX: item.phaseX, phaseY: item.phaseY, stepX: item.stepX, stepY: item.stepY,
       coherence: item.coherence || 0, error: item.error === undefined ? 1 : item.error, removed: item.removed || []
@@ -3869,6 +4428,7 @@ img{display:block;max-width:100%}
       targetMode: 'cell',
       cellIndex: ci,
       rawCellUrl: rawCellUrl,
+      bodySetting: bodySetting,
       frameDataUrl: outCanvas.toDataURL('image/png'),
       source: nextSourceId(),
       palette: palette,
@@ -3885,7 +4445,9 @@ img{display:block;max-width:100%}
     var ci = checked.cellIndex;
     state.rawFrames[ci] = checked.rawCellUrl;
     state.frames[ci] = checked.frameDataUrl;
+    state.unlockedFrames[ci] = checked.frameDataUrl;
     state.sources[ci] = checked.source;
+    if (checked.bodySetting) state.bodyCellHeights[checked.source] = checked.bodySetting;
     state.edited[ci] = !!checked.isLocalMask;
     state.scaleApprovals[ci] = false;
     if (!state.palette && checked.palette) state.palette = checked.palette;
@@ -3977,6 +4539,7 @@ img{display:block;max-width:100%}
       state.variants = variants.map(function(v){
         v.targetMode = 'cell';
         v.targetCell = cellIndex;
+        v.useBodyGrid = hasBaseBody;
         v.localMaskDataUrl = localMaskDataUrl;
         v.baseFrameDataUrl = baseFrameDataUrl;
         return v;
@@ -4036,9 +4599,13 @@ img{display:block;max-width:100%}
         rawFrames: all ? new Array(12).fill('') : state.rawFrames.slice(),
         frames: all ? new Array(12).fill('') : state.frames.slice(),
         sources: all ? new Array(12).fill('') : state.sources.slice(),
+        bodyCellHeights: all ? {} : Object.assign({}, state.bodyCellHeights),
         edited: all ? new Array(12).fill(false) : state.edited.slice(),
         scaleApprovals: all ? new Array(12).fill(false) : state.scaleApprovals.slice()
       };
+      // Projection cuts find clear crop boundaries. The pitch comes from
+      // the nominal panels so all poses use one scale despite uneven margins.
+      if (v.useBodyGrid) input.bodyCellHeights[gid] = frames.sheetMeta ? frames.sheetMeta.h / 4 : frames.cellHeight;
       indices.forEach(function(i, j){
         input.rawFrames[i] = frames[j];
         input.sources[i] = gid;
@@ -4103,11 +4670,12 @@ img{display:block;max-width:100%}
   function applyVariant(idx, evaluation){
     var v = state.variants[idx];
     if (!v || !v.usable) return Promise.resolve();
-    var finish = function(checked){
+    var finish = async function(checked){
       if (!checked) { setStatus('这个变体无法使用', true); return; }
       state.selectedVariant = idx;
       if (checked.targetMode === 'cell') {
         commitSingleCellResult(checked);
+        await refreshBodyLocks([Math.floor(checked.cellIndex / 3)]);
         renderVariants(); renderGrid(); saveLocal();
         if ($('editorDialog').open && editIndex === checked.cellIndex) {
           refreshEditorAfterRedraw(checked.cellIndex, checked);
@@ -4128,7 +4696,7 @@ img{display:block;max-width:100%}
         state.rawSheetCuts = checked.sheetMeta;
         state.rawSheetCells = state.rawFrames.slice();
       }
-      commitProcessed(checked.result);
+      await commitProcessed(checked.result, v.targetMode === 'row' ? [v.targetDir || 0] : null);
       renderVariants(); renderPool(); renderGrid(); saveLocal();
       setStatus('已应用变体 #' + (idx + 1));
       toast(state.overflow.length ? '请处理超限帧' : '处理完成');
@@ -4231,14 +4799,17 @@ img{display:block;max-width:100%}
       cell.classList.toggle('overflow', isOverflow);
       var im = cell.querySelector('img');
       var badge = cell.querySelector('.badge');
+      badge.title = '';
       var frame = state.frames[i];
       if (isOverflow) {
         im.src = frame; im.classList.remove('ghost');
         badge.textContent = '超限'; badge.className = 'badge warn';
       } else if (frame) {
         im.src = frame; im.classList.remove('ghost');
-        badge.textContent = state.edited[i] ? STEP_LABEL[i % 3] + '·手修' : STEP_LABEL[i % 3];
-        badge.className = 'badge';
+        var suggest = state.lockResults[i] && state.lockResults[i].suggested && !state.edited[i];
+        badge.textContent = suggest ? '建议重画' : state.edited[i] ? STEP_LABEL[i % 3] + '·手修' : STEP_LABEL[i % 3];
+        badge.className = suggest ? 'badge warn' : 'badge';
+        if (suggest) badge.title = '建议重画这一帧';
       } else {
         im.src = templateReady ? templateFrameUrl(i, state.pp.size) : '';
         im.classList.add('ghost');
@@ -4326,9 +4897,12 @@ img{display:block;max-width:100%}
         var dstIdx = toRow * 3 + col;
         var pFrame = state.frames[srcIdx] ? flipDataUrlH(state.frames[srcIdx]) : Promise.resolve('');
         var pRaw = state.rawFrames[srcIdx] ? flipDataUrlH(state.rawFrames[srcIdx]) : Promise.resolve('');
-        tasks.push(Promise.all([pFrame, pRaw]).then(function(res){
+        var pUnlocked = state.unlockedFrames[srcIdx] ? flipDataUrlH(state.unlockedFrames[srcIdx]) : pFrame;
+        tasks.push(Promise.all([pFrame, pRaw, pUnlocked]).then(function(res){
           state.frames[dstIdx] = res[0];
           state.rawFrames[dstIdx] = res[1];
+          state.unlockedFrames[dstIdx] = res[2];
+          state.lockResults[dstIdx] = null;
           state.scaleApprovals[dstIdx] = state.scaleApprovals[srcIdx];
           state.overflow = state.overflow.filter(function(i){ return i !== dstIdx; });
           if (state.overflow.indexOf(srcIdx) >= 0) state.overflow.push(dstIdx);
@@ -4619,8 +5193,10 @@ img{display:block;max-width:100%}
     var data = {
       format: 'rm-walk-project@2',
       frames: state.frames,
+      unlockedFrames: state.unlockedFrames,
       rawFrames: state.rawFrames,
       sources: state.sources,
+      bodyCellHeights: state.bodyCellHeights,
       edited: state.edited,
       overflow: state.overflow,
       scaleApprovals: state.scaleApprovals,
@@ -4665,6 +5241,7 @@ img{display:block;max-width:100%}
     state.pp.paletteCount = Number($('ppPalette').value);
     state.pp.footMargin = Number($('ppFootMargin').value);
     state.pp.pixelSnap = $('ppPixelSnap').checked;
+    state.pp.lockUpper = $('ppLockUpper').checked;
     state.pp.alphaThresh = Number($('ppAlphaThresh').value);
     state.pp.outline = $('ppOutline').checked;
     state.pp.outlineColor = $('ppOutlineColor').value;
@@ -4688,6 +5265,7 @@ img{display:block;max-width:100%}
     $('ppPalette').value = String(state.pp.paletteCount);
     $('ppFootMargin').value = String(state.pp.footMargin);
     $('ppPixelSnap').checked = state.pp.pixelSnap !== false;
+    $('ppLockUpper').checked = state.pp.lockUpper !== false;
     $('ppAlphaThresh').value = String(state.pp.alphaThresh);
     $('ppAlphaVal').textContent = String(state.pp.alphaThresh);
     $('ppOutline').checked = state.pp.outline;
@@ -4767,6 +5345,10 @@ img{display:block;max-width:100%}
      'ppSize','ppBgMode','ppPalette','ppFootMargin','ppPixelSnap','ppOutline','ppOutlineColor'].forEach(function(id){
       $(id).addEventListener('change', function(){ syncStateFromInputs(); saveLocal(); renderGrid(); });
     });
+    $('ppLockUpper').addEventListener('change', function(){
+      syncStateFromInputs();
+      refreshBodyLocks().then(function(){ renderGrid(); saveLocal(); });
+    });
     $('ppBgTol').addEventListener('input', function(){ $('ppBgTolVal').textContent = this.value; syncStateFromInputs(); });
     $('ppBgTol').addEventListener('change', saveLocal);
     $('ppAlphaThresh').addEventListener('input', function(){ $('ppAlphaVal').textContent = this.value; syncStateFromInputs(); });
@@ -4844,6 +5426,7 @@ img{display:block;max-width:100%}
           v.targetMode = isAll ? 'all' : 'row';
           v.targetDir = dirIdx;
           v.expect4x3 = isAll;
+          v.useBodyGrid = hasBaseBody;
           return v;
         });
         return rankVariants();
@@ -4873,6 +5456,7 @@ img{display:block;max-width:100%}
           v.localMaskDataUrl = opts.localMaskDataUrl || '';
           v.baseFrameDataUrl = opts.baseFrameDataUrl || '';
           v.expect4x3 = !!opts.expect4x3;
+          v.useBodyGrid = !!getSelectedBaseBody();
           return v;
         });
         return rankVariants().then(function(){ return state.variants.length; });
@@ -4970,12 +5554,16 @@ img{display:block;max-width:100%}
     $('btnMirrorL2R').addEventListener('click', function(){ mirrorRow(1, 2); });
     $('btnMirrorR2L').addEventListener('click', function(){ mirrorRow(2, 1); });
     $('btnClearAll').addEventListener('click', function(){
+      ++lockRefresh;
       state.frames = new Array(12).fill('');
+      state.unlockedFrames = state.frames.slice();
+      state.lockResults = new Array(12).fill(null);
       state.rawFrames = new Array(12).fill('');
       state.rawSheet = '';
       state.rawSheetCuts = null;
       state.rawSheetCells = null;
       state.sources = new Array(12).fill('');
+      state.bodyCellHeights = {};
       state.edited = new Array(12).fill(false);
       state.overflow = [];
       state.scaleApprovals.fill(false);
@@ -4997,11 +5585,14 @@ img{display:block;max-width:100%}
         var d = JSON.parse(txt);
         if (!d || !Array.isArray(d.frames) || d.frames.length !== 12) throw new Error('无效工程文件');
         state.frames = d.frames;
+        state.unlockedFrames = d.unlockedFrames || state.frames.slice();
+        state.lockResults = new Array(12).fill(null);
         state.rawFrames = Array.isArray(d.rawFrames) && d.rawFrames.length === 12 ? d.rawFrames : d.frames.slice();
         state.rawSheet = '';
         state.rawSheetCuts = null;
         state.rawSheetCells = null;
         state.sources = Array.isArray(d.sources) && d.sources.length === 12 ? d.sources : state.rawFrames.map(function(_, idx){ return 'legacy_' + Math.floor(idx / 3); });
+        state.bodyCellHeights = d.bodyCellHeights || {};
         state.edited = Array.isArray(d.edited) && d.edited.length === 12 ? d.edited.map(Boolean) : new Array(12).fill(false);
         state.overflow = d.overflow || [];
         state.scaleApprovals = d.scaleApprovals || new Array(12).fill(false);
@@ -5020,8 +5611,10 @@ img{display:block;max-width:100%}
         state.seqQuality = d.seqQuality || 'low';
         state.mzPrefix = d.mzPrefix !== false;
         if (d.pp) state.pp = Object.assign(state.pp, d.pp);
-        applyStateToInputs(); renderGrid(); saveLocal();
-        toast('工程已导入');
+        applyStateToInputs();
+        return refreshBodyLocks().then(function(){
+          renderGrid(); saveLocal(); toast('工程已导入');
+        });
       }).catch(function(e){ toast('导入失败：' + e.message, 3600); });
     });
 
@@ -5194,7 +5787,11 @@ img{display:block;max-width:100%}
       if (state.overflow.indexOf(editIndex) >= 0) { $('editorDialog').close(); return; }
       binaryAlpha($('editCanvas'), state.pp.alphaThresh);
       state.frames[editIndex] = $('editCanvas').toDataURL('image/png');
-      if (editModified || editUndo.length > 0) state.edited[editIndex] = true;
+      if (editModified || editUndo.length > 0) {
+        state.edited[editIndex] = true;
+        state.unlockedFrames[editIndex] = state.frames[editIndex];
+        state.lockResults[editIndex] = null;
+      }
       renderGrid(); saveLocal();
       $('editorDialog').close();
       toast('第 ' + (editIndex + 1) + ' 帧已保存');
@@ -5244,6 +5841,7 @@ img{display:block;max-width:100%}
     renderVariants();
     renderPool();
     renderGrid();
+    if (state.frames.some(Boolean)) refreshBodyLocks().then(renderGrid);
     startPreview();
   }
 

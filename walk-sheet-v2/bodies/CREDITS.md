@@ -4,7 +4,7 @@
 
 | 文件 | 名称 | 体型 (`build`) | 作者 | 来源 | 许可证 | 导出署名要求 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `chibi-walk.png` | Q版大头·步态 | `chibi` | 本项目原创（参考 Cabbit CC0 步态） | 本仓库 `test/make-chibi-walk.py` 逐像素生成 | CC0 | 免署名，可商用、可改编 |
+| `chibi-walk.png` | Q版大头·步态 | `chibi` | 本项目原创（参考 Cabbit CC0 步态） | 本仓库 `bodies/tools/make-chibi-walk.py` 逐像素生成 | CC0 | 免署名，可商用、可改编 |
 | `floursack-chibi.png` | Q版大头 | `chibi` | Kicked-in-Teeth | https://kicked-in-teeth.itch.io/floursack-base | CC BY-SA | **需要署名** Kicked-in-Teeth；若公开分发基于此素体改编的素材，需以相同许可（CC BY-SA）共享 |
 | `cabbit-child.png` | 小孩 | `child` | Cabbit / diamonddmgirl / AntumDeluge | https://opengameart.org/node/84455 | CC0 | 免署名，可商用、可改编 |
 | `cabbit-standard.png` | 标准 | `standard` | Cabbit / diamonddmgirl / AntumDeluge | https://opengameart.org/node/84455 | CC0 | 免署名，可商用、可改编 |
